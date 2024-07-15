@@ -1,34 +1,47 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-# Copyright (c) 2014-2024 Zuru Tech HK Limited, All rights reserved.
-
-import argparse
 import re
 import sys
+import argparse
+
 from argparse import ArgumentParser
+from dataclasses import astuple, dataclass
 from datetime import date
 from functools import reduce
 from operator import concat
 from pathlib import Path
+from typing import Optional
 
-NEW_NOTICE = f" Copyright (c) 2014-{date.today().year} Zuru Tech HK Limited, All rights reserved."
-SUPPORTED_EXTENSIONS = ["h", "cpp", "cs", "py"]
-EXTENSIONS_REGEX = {
-    "h": r"(/\*.*?\*/)|(//[^\n]*\n)",
-    "cpp": r"(/\*.*?\*/)|(//[^\n]*\n)",
-    "cs": r"(/\*.*?\*/)|(//[^\n]*\n)",
-    "py": r"('''.*?''')|(\"\"\".*?\"\"\")|(#[^\n]*\n)",
+NOTICE_STR = f"Copyright (c) 2014-{date.today().year} Zuru Tech HK Limited, All rights reserved."
+
+NOTICES = {'c' : f'// {NOTICE_STR}', 'sh' : f'# {NOTICE_STR}'}
+
+CLIKE_EXTENSIONS = {".h", ".hh", ".hpp", ".c", ".cc", ".cpp", ".cxx", ".cs", ".rs", ".java", ".kt", ".go"}
+SHLIKE_EXTENSIONS = {".sh", ".pl", ".py", ".pyx", ".pxd", ".rb"}
+SKIP_STRINGS = {"// open source, not our code", "# open source, not our code"}
+
+PATTERNS = {
+    "c" : re.compile(r"(/\*.*?\*/)|(//[^\n]*\n)", re.S),
+    "sh" : re.compile(r"(#[^\n]*\n)", re.S),
 }
-EXTENSIONS_COMMENT = {"h": "//", "cpp": "//", "cs": "//", "py": "#"}
 
 
-def getArguments() -> argparse.Namespace:
+@dataclass
+class ProbedFile:
+    tag: str
+    file: Path
+
+    def __iter__(self):
+        return iter(astuple(self))
+
+
+def get_arguments() -> argparse.Namespace:
     """CLI parser.
     Returns:
         The folder to use as root.
     """
     parser = ArgumentParser(
-        description="Update the copyright notice of all the C++ and C# files in the specified folder"
+        description="Update the copyright notice of all the C, C++ and C# files in the specified folder"
     )
     parser.add_argument(
         "--folder", default="-", help="Root folder that will be traversed"
@@ -42,71 +55,104 @@ def getArguments() -> argparse.Namespace:
     return args
 
 
-def getFileList(args: list[str]) -> list[str]:
+def get_file_list(args: list[str]) -> list[str]:
     fileList = []
     if args.folder != "-":
         root = Path(args.folder)
-        for ext in SUPPORTED_EXTENSIONS:
+        for ext in CLIKE_EXTENSIONS:
             for f in root.rglob(f"*.{ext}"):
-                fileList.append(f)
+                fileList.append(ProbedFile('c', f))
 
-    if len(args.files) > 0:
-        fileList.extend(args.files)
+        for ext in SHLIKE_EXTENSIONS:
+            for f in root.rglob(f"*.{ext}"):
+                fileList.sh.append(ProbedFile('sh', f))
+
+    fileList.extend(filter(None, map(lambda f: tag_file(Path(f)), args.files)))
 
     return fileList
 
 
+def match_comments(tag: str, content: str) -> list[str]:
+    comments = PATTERNS[tag].findall(content)
+
+    if comments and tag == "c":
+        comments = reduce(concat, [list(filter(None, x)) for x in comments])
+
+    return comments
+
+
+def should_skip(content: str) -> bool:
+    return any(skip_string in content for skip_string in SKIP_STRINGS)
+
+
+def split_shebang(content: str) -> tuple[str, str]:
+    if content.startswith("#!"):
+        shebang, content = content.split("\n", 1)
+
+        return shebang + '\n\n', content
+
+    return "", content
+
+
+def tag_file(file: Path) -> Optional[ProbedFile]:
+    if file.suffix in CLIKE_EXTENSIONS:
+        return ProbedFile("c", file)
+    elif file.suffix in SHLIKE_EXTENSIONS:
+        return ProbedFile("sh", file)
+
+
 def main() -> int:
-    args = getArguments()
-    fileList = getFileList(args)
+    args = get_arguments()
+    fileList = get_file_list(args)
 
     empty_files = []
+    skipped_files = []
 
-    for f in fileList:
-        for ext in SUPPORTED_EXTENSIONS:
-            if f.__str__().endswith(ext):
-                pattern = re.compile(EXTENSIONS_REGEX[ext], re.S)
-                notice = f"{EXTENSIONS_COMMENT[ext]}{NEW_NOTICE}"
-                break
+    for (tag, f) in fileList:
         with open(f, "r+", encoding="utf-8") as fp:
             try:
                 original_content = content = fp.read()
             except UnicodeDecodeError as e:
                 print("UnicodeDecodeError ", e, "\nfile: ", f)
                 continue
+
             if not content:
                 empty_files.append(f)
                 continue
-            comments = pattern.findall(content)
+
+            if should_skip(content):
+                skipped_files.append(f)
+                continue
+
+            comments = match_comments(tag, content)
             replaced = False
             if comments:
-                comments = reduce(concat, [list(filter(None, x)) for x in comments])
                 for comment in comments:
-                    if "copyright" in comment.lower() and not "zuru tech" in comment.lower():
-                        replaced = True
-                        break
-                    elif "copyright" in comment.lower():
-                        content = content.replace(comment, f"{notice}\n", 1)
+                    if "copyright" in comment.lower():
+                        content = content.replace(comment, f"{NOTICES[tag]}\n", 1)
                         replaced = True
                         break
             if not comments or (not replaced and comments):
-                lines = content.split("\n")
-                if lines[0].startswith("#!"):
-                    lines.insert(2, notice)
-                else:
-                    lines.insert(0, notice)
-                content = "\n".join(lines)
+                shebang, content = split_shebang(content)
+
+                content = f"{shebang}{NOTICES[tag]}\n\n" + content
 
         # Write the new content with unix style EOL (otherwise, on windows it would be "\r\n")
         if original_content != content:
             print("Updating ", f)
-            with open(f, "w", encoding="utf-8", newline="\n") as fp:
+            with open(f, "w", encoding="utf-8", newline='\n') as fp:
                 fp.write(content)
 
     if empty_files:
         print("Find the following empty files while working...")
         for idx, f in enumerate(empty_files, start=1):
-            print(idx, ") ", f)
+            print(idx, "> ", f)
+
+    if skipped_files:
+        print("The following files self-identified as open source and were thus skipped:")
+        for idx, f in enumerate(skipped_files, start=1):
+            print(idx, "> ", f)
+
     return 0
 
 
